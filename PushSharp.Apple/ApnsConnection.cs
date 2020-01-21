@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Net;
 using PushSharp.Core;
+using System.Collections.Concurrent;
 
 namespace PushSharp.Apple
 {
@@ -80,7 +81,7 @@ namespace PushSharp.Apple
         object notificationBatchQueueLock = new object();
 
         //readonly object connectingLock = new object ();
-        Queue<CompletableApnsNotification> notifications = new Queue<CompletableApnsNotification>();
+        ConcurrentQueue<CompletableApnsNotification> notifications = new ConcurrentQueue<CompletableApnsNotification>();
         List<SentNotification> sent = new List<SentNotification>();
 
         Timer timerBatchWait;
@@ -125,12 +126,13 @@ namespace PushSharp.Apple
                 return;
 
             // Let's store the batch items to send internally
-            var toSend = new List<CompletableApnsNotification>();
+            var toSend = new BlockingCollection<CompletableApnsNotification>();
 
             while (notifications.Count > 0 && toSend.Count < Configuration.InternalBatchSize)
             {
-                var n = notifications.Dequeue();
-                toSend.Add(n);
+                CompletableApnsNotification n;
+                if (notifications.TryDequeue(out n))
+                    toSend.Add(n);
             }
 
 
@@ -172,15 +174,31 @@ namespace PushSharp.Apple
                     }
 
                     foreach (var n in toSend)
-                        sent.Add(new SentNotification(n));
+                    {
+                        if (!n.Notification.IsDeviceRegistrationIdValid())
+                            n.CompleteFailed(new ApnsNotificationException(ApnsNotificationErrorStatusCode.ConnectionError, n.Notification));
+                        else
+                            sent.Add(new SentNotification(n));
+                    }
                 }
 
             }
             catch (Exception ex)
             {
                 Log.Error("APNS-CLIENT[{0}]: Send Batch Error: Batch ID={1}, Error={2}", id, batchId, ex);
+
+                var errorNotificationToSend = new List<CompletableApnsNotification>();
                 foreach (var n in toSend)
+                {
+                    if (!n.Notification.IsDeviceRegistrationIdValid())
+                        errorNotificationToSend.Add(n);
+                    else
+                        notifications.Enqueue(n);
+                }
+
+                foreach (var n in errorNotificationToSend)
                     n.CompleteFailed(new ApnsNotificationException(ApnsNotificationErrorStatusCode.ConnectionError, n.Notification, ex));
+
             }
 
             Log.Info("APNS-Client[{0}]: Sent Batch, waiting for possible response...", id);
@@ -200,7 +218,7 @@ namespace PushSharp.Apple
             timerBatchWait.Change(Configuration.InternalBatchingWaitPeriod, Timeout.InfiniteTimeSpan);
         }
 
-        byte[] createBatch(List<CompletableApnsNotification> toSend)
+        byte[] createBatch(BlockingCollection<CompletableApnsNotification> toSend)
         {
             if (toSend == null || toSend.Count <= 0)
                 return null;
@@ -209,9 +227,40 @@ namespace PushSharp.Apple
 
             // Add all the frame data
             foreach (var n in toSend)
-                batchData.AddRange(n.Notification.ToBytes());
+            {
+                CompletableApnsNotification temp = n;
+                try
+                {
+                    if (n != null && n.Notification != null)
+                        batchData.AddRange(n.Notification.ToBytes());
+                }
+                catch (NotificationException ex)
+                {
+                    toSend.TryTake(out temp);
+                    temp.CompleteFailed(new ApnsNotificationException(GetApnsNotificationErrorStatusCode(ex), n.Notification, ex));
+                }
+                finally
+                {
+                    if (batchData == null)
+                        batchData = new List<byte>();
+                }
+            }
 
             return batchData.ToArray();
+        }
+
+        private ApnsNotificationErrorStatusCode GetApnsNotificationErrorStatusCode(Exception ex)
+        {
+            var apnsErrorStatusCode = ApnsNotificationErrorStatusCode.ConnectionError;
+            if (ex.Message.Contains("Missing DeviceToken"))
+                apnsErrorStatusCode = ApnsNotificationErrorStatusCode.MissingDeviceToken;
+            else if (ex.Message.Contains("Invalid DeviceToken"))
+                apnsErrorStatusCode = ApnsNotificationErrorStatusCode.InvalidToken;
+            else if (ex.Message.Contains("Invalid DeviceToken Length"))
+                apnsErrorStatusCode = ApnsNotificationErrorStatusCode.InvalidTokenSize;
+            else if (ex.Message.Contains("Payload too large"))
+                apnsErrorStatusCode = ApnsNotificationErrorStatusCode.InvalidPayloadSize;
+            return apnsErrorStatusCode;
         }
 
         async Task Reader()
@@ -230,7 +279,7 @@ namespace PushSharp.Apple
             {
 
                 // See if there's data to read
-                if (client.Client.Available > 0)
+                if (client != null && client.Client != null && client.Client.Available > 0)
                 {
                     Log.Info("APNS-Client[{0}]: Data Available...", id);
                     len = await networkStream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
@@ -396,8 +445,7 @@ namespace PushSharp.Apple
 
                 try
                 {
-                    var tls = System.Security.Authentication.SslProtocols.Tls | System.Security.Authentication.SslProtocols.Tls11 | System.Security.Authentication.SslProtocols.Tls12;
-                    stream.AuthenticateAsClient(Configuration.Host, certificates, tls, false);
+                    stream.AuthenticateAsClient(Configuration.Host, certificates, System.Security.Authentication.SslProtocols.Tls, false);
                 }
                 catch (System.Security.Authentication.AuthenticationException ex)
                 {
